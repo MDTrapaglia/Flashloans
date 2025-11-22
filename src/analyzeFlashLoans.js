@@ -48,6 +48,17 @@ const chunk = (arr, size) => {
 
 const shortenAddress = (address) => `${address.slice(0, 6)}...${address.slice(-4)}`;
 
+const chunkBlockRange = (fromBlock, toBlock, maxSpan) => {
+  const ranges = [];
+  let start = fromBlock;
+  while (start <= toBlock) {
+    const end = Math.min(start + maxSpan - 1, toBlock);
+    ranges.push([start, end]);
+    start = end + 1;
+  }
+  return ranges;
+};
+
 const parseOptionalInt = (value) => {
   if (value === undefined || value === null || value === '') {
     return undefined;
@@ -238,6 +249,7 @@ const main = async () => {
   const explicitToBlock = parseOptionalInt(process.env.TO_BLOCK);
 
   const alchemy = new Alchemy({ apiKey, network });
+  const maxBlockSpan = parseEnvInt('LOG_CHUNK_BLOCKS', 10);
 
   const latestBlockNumber = await alchemy.core.getBlockNumber();
   const toBlock = explicitToBlock ?? latestBlockNumber;
@@ -250,19 +262,24 @@ const main = async () => {
   console.log(`Red: ${process.env.ALCHEMY_NETWORK || DEFAULT_NETWORK}`);
   console.log(`Rango de bloques: ${fromBlock} - ${toBlock}`);
 
-  const logs = await alchemy.core.getLogs({
-    address: poolAddress,
-    fromBlock: toQuantity(fromBlock),
-    toBlock: toQuantity(toBlock),
-    topics: [FLASH_LOAN_TOPIC],
-  });
+  const allLogs = [];
+  const ranges = chunkBlockRange(fromBlock, toBlock, maxBlockSpan);
+  for (const [chunkFrom, chunkTo] of ranges) {
+    const logs = await alchemy.core.getLogs({
+      address: poolAddress,
+      fromBlock: toQuantity(chunkFrom),
+      toBlock: toQuantity(chunkTo),
+      topics: [FLASH_LOAN_TOPIC],
+    });
+    allLogs.push(...logs);
+  }
 
-  if (!logs.length) {
+  if (!allLogs.length) {
     console.log('No se encontraron eventos FlashLoan en el rango seleccionado.');
     return;
   }
 
-  const parsedEvents = logs.map((log) => decodeLog(log));
+  const parsedEvents = allLogs.map((log) => decodeLog(log));
   const assets = Array.from(new Set(parsedEvents.map((event) => event.asset)));
   const metadataMap = await fetchTokenMetadata(alchemy, assets);
   const priceMap = await fetchUsdPrices(assets);
