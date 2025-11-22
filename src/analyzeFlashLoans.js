@@ -1,4 +1,5 @@
 import { config as loadEnv } from 'dotenv';
+import { promises as fs } from 'fs';
 import { Alchemy, Network } from 'alchemy-sdk';
 import { Interface, formatUnits, getAddress, toQuantity } from 'ethers';
 
@@ -24,19 +25,9 @@ const networkMap = {
   'optimism-goerli': Network.OPT_GOERLI,
 };
 
-const numberFormatter = new Intl.NumberFormat('en-US', {
-  maximumFractionDigits: 2,
-});
-
-const usdFormatter = new Intl.NumberFormat('en-US', {
-  style: 'currency',
-  currency: 'USD',
-  maximumFractionDigits: 2,
-});
-
-const shortFormatter = new Intl.NumberFormat('en-US', {
-  maximumFractionDigits: 4,
-});
+const numberFormatter = new Intl.NumberFormat('en-US', { maximumFractionDigits: 2 });
+const usdFormatter = new Intl.NumberFormat('en-US', { style: 'currency', currency: 'USD', maximumFractionDigits: 2 });
+const shortFormatter = new Intl.NumberFormat('en-US', { maximumFractionDigits: 4 });
 
 const chunk = (arr, size) => {
   const result = [];
@@ -57,6 +48,21 @@ const chunkBlockRange = (fromBlock, toBlock, maxSpan) => {
     start = end + 1;
   }
   return ranges;
+};
+
+const parseEnvBool = (key, fallback) => {
+  const rawValue = process.env[key];
+  if (rawValue === undefined) {
+    return fallback;
+  }
+  const normalized = rawValue.toLowerCase().trim();
+  if (['true', '1', 'yes', 'y'].includes(normalized)) {
+    return true;
+  }
+  if (['false', '0', 'no', 'n'].includes(normalized)) {
+    return false;
+  }
+  throw new Error(`La variable ${key} debe ser booleana (true/false).`);
 };
 
 const parseOptionalInt = (value) => {
@@ -82,6 +88,31 @@ const parseEnvInt = (key, fallback) => {
   return parsed;
 };
 
+const describeRpcError = (error) => {
+  if (!error) {
+    return 'Error desconocido';
+  }
+  if (error.error?.message) {
+    return `${error.error.message} (código ${error.error.code ?? 'N/A'})`;
+  }
+  const bodyText = error.body || error.response?.body;
+  if (bodyText) {
+    try {
+      const parsed = JSON.parse(bodyText);
+      if (parsed?.error?.message) {
+        return `${parsed.error.message} (código ${parsed.error.code ?? 'N/A'})`;
+      }
+    } catch {
+      return bodyText;
+    }
+    return bodyText;
+  }
+  if (error.message) {
+    return error.message;
+  }
+  return 'Error desconocido';
+};
+
 const resolveNetwork = (value) => {
   const normalized = (value || DEFAULT_NETWORK).toLowerCase();
   const selected = networkMap[normalized];
@@ -90,6 +121,72 @@ const resolveNetwork = (value) => {
     throw new Error(`Red "${normalized}" no soportada. Opciones: ${available}`);
   }
   return selected;
+};
+
+const readProgressFile = async (filepath) => {
+  if (!filepath) {
+    return null;
+  }
+  try {
+    const data = await fs.readFile(filepath, 'utf8');
+    return JSON.parse(data);
+  } catch (error) {
+    if (error?.code !== 'ENOENT') {
+      console.warn(`No se pudo leer ${filepath}: ${error.message}`);
+    }
+    return null;
+  }
+};
+
+const writeProgressFile = async (filepath, payload) => {
+  if (!filepath) {
+    return;
+  }
+  try {
+    await fs.writeFile(filepath, JSON.stringify(payload, null, 2));
+  } catch (error) {
+    console.warn(`No se pudo guardar ${filepath}: ${error.message}`);
+  }
+};
+
+const formatIso = (timestamp) => {
+  if (!timestamp) {
+    return 'N/D';
+  }
+  return new Date(timestamp * 1000).toISOString();
+};
+
+const fetchBlockTimestamp = async (alchemy, blockNumber) => {
+  if (blockNumber === undefined || blockNumber === null || blockNumber < 0) {
+    return null;
+  }
+  try {
+    const block = await alchemy.core.getBlock(blockNumber);
+    return block?.timestamp ?? null;
+  } catch (error) {
+    console.warn(`No se pudo obtener timestamp para bloque ${blockNumber}: ${error.message}`);
+    return null;
+  }
+};
+
+const renderProgressLine = ({
+  windowIndex,
+  maxWindows,
+  chunkIndex,
+  chunkTotal,
+  chunkFrom,
+  chunkTo,
+  fromTimeIso,
+  toTimeIso,
+  logsCollected,
+}) => {
+  const windowLabel = maxWindows === Infinity ? `${windowIndex}` : `${windowIndex}/${maxWindows}`;
+  const line = `[Ventana ${windowLabel}] Chunk ${chunkIndex}/${chunkTotal} | Bloques ${chunkFrom}-${chunkTo} (${fromTimeIso} -> ${toTimeIso}) | Logs acumulados: ${logsCollected}`;
+  if (process.stdout.isTTY) {
+    process.stdout.write(`\r${line}`);
+  } else {
+    console.log(line);
+  }
 };
 
 const decodeLog = (log) => {
@@ -250,7 +347,11 @@ const main = async () => {
 
   const alchemy = new Alchemy({ apiKey, network });
   const maxBlockSpan = parseEnvInt('LOG_CHUNK_BLOCKS', 10);
-  const maxLookbackWindows = parseEnvInt('MAX_LOOKBACK_WINDOWS', 1);
+  const maxLookbackWindowsRaw = process.env.MAX_LOOKBACK_WINDOWS;
+  const infiniteLookback = !maxLookbackWindowsRaw || maxLookbackWindowsRaw.toLowerCase() === 'none';
+  const maxLookbackWindows = infiniteLookback ? Infinity : parseEnvInt('MAX_LOOKBACK_WINDOWS', 1);
+  const progressFilePath = process.env.PROGRESS_FILE || '.flashloan-progress.json';
+  const resumeFromProgress = parseEnvBool('RESUME_FROM_PROGRESS', false);
 
   if (blockWindow <= 0) {
     throw new Error('BLOCK_WINDOW debe ser mayor a 0.');
@@ -258,12 +359,23 @@ const main = async () => {
   if (maxBlockSpan <= 0) {
     throw new Error('LOG_CHUNK_BLOCKS debe ser mayor a 0.');
   }
-  if (maxLookbackWindows <= 0) {
+  if (!infiniteLookback && maxLookbackWindows <= 0) {
     throw new Error('MAX_LOOKBACK_WINDOWS debe ser mayor a 0.');
   }
 
   const latestBlockNumber = await alchemy.core.getBlockNumber();
-  const toBlock = explicitToBlock ?? latestBlockNumber;
+  const savedProgress = resumeFromProgress ? await readProgressFile(progressFilePath) : null;
+  const resumeTarget =
+    resumeFromProgress && savedProgress?.nextToBlock !== undefined
+      ? savedProgress.nextToBlock
+      : undefined;
+  if (resumeTarget !== undefined) {
+    console.log(
+      `Reanudando desde bloque ${resumeTarget} usando progreso guardado en ${progressFilePath}`,
+    );
+  }
+
+  const toBlock = explicitToBlock ?? resumeTarget ?? latestBlockNumber;
   const fromBlock = explicitFromBlock ?? Math.max(toBlock - blockWindow + 1, 0);
 
   console.log('==============================================');
@@ -272,20 +384,50 @@ const main = async () => {
   console.log(`Contrato Pool: ${poolAddress}`);
   console.log(`Red: ${process.env.ALCHEMY_NETWORK || DEFAULT_NETWORK}`);
   console.log(`Rango de bloques: ${fromBlock} - ${toBlock}`);
+  if (!explicitFromBlock && !explicitToBlock) {
+    console.log(
+      `Ventanas automáticas configuradas: tamaño=${blockWindow} bloques, máximo=${maxLookbackWindows}`,
+    );
+  }
+  if (resumeTarget !== undefined) {
+    console.log(`Progreso previo: se retomará desde el bloque ${toBlock}.`);
+  }
 
   const allLogs = [];
   const shouldIterateBackwards = explicitFromBlock === undefined && explicitToBlock === undefined;
   let currentFrom = fromBlock;
   let currentTo = toBlock;
   let windowsProcessed = 0;
+  let foundLogs = false;
+  const totalBlocksScanned = () => windowsProcessed * blockWindow;
 
   while (currentTo >= currentFrom && currentTo >= 0) {
     windowsProcessed += 1;
-    console.log(
-      `Buscando eventos en ventana #${windowsProcessed}: bloques ${currentFrom} - ${currentTo}`,
-    );
+    const [fromTs, toTs] = await Promise.all([
+      fetchBlockTimestamp(alchemy, currentFrom),
+      fetchBlockTimestamp(alchemy, currentTo),
+    ]);
+    const windowLabel = maxLookbackWindows === Infinity ? `${windowsProcessed}` : `${windowsProcessed}/${maxLookbackWindows}`;
+    const windowHeader = `[Ventana ${windowLabel}] Bloques ${currentFrom}-${currentTo} (${formatIso(
+      fromTs,
+    )} -> ${formatIso(toTs)})`;
+    console.log(`${windowHeader} | Bloques recorridos hasta ahora: ${totalBlocksScanned()}`);
+
     const ranges = chunkBlockRange(currentFrom, currentTo, maxBlockSpan);
+    let chunkIndex = 0;
     for (const [chunkFrom, chunkTo] of ranges) {
+      chunkIndex += 1;
+      renderProgressLine({
+        windowIndex: windowsProcessed,
+        maxWindows: maxLookbackWindows,
+        chunkIndex,
+        chunkTotal: ranges.length,
+        chunkFrom,
+        chunkTo,
+        fromTimeIso: formatIso(fromTs),
+        toTimeIso: formatIso(toTs),
+        logsCollected: allLogs.length,
+      });
       try {
         const logs = await alchemy.core.getLogs({
           address: poolAddress,
@@ -294,18 +436,39 @@ const main = async () => {
           topics: [FLASH_LOAN_TOPIC],
         });
         allLogs.push(...logs);
+        if (logs.length > 0) {
+          foundLogs = true;
+          break;
+        }
       } catch (error) {
         console.warn(
-          `Error al consultar bloques ${chunkFrom}-${chunkTo}: ${error.message}. Intentando continuar...`,
+          `\nError al consultar bloques ${chunkFrom}-${chunkTo}: ${describeRpcError(
+            error,
+          )}. Intentando continuar...`,
         );
       }
     }
+    if (process.stdout.isTTY) {
+      process.stdout.write('\n');
+    }
+
+    if (foundLogs) {
+      break;
+    }
+
+    const nextResumeBlock = Math.max(currentFrom - 1, 0);
+    await writeProgressFile(progressFilePath, {
+      lastWindowRange: { from: currentFrom, to: currentTo },
+      nextToBlock: nextResumeBlock,
+      updatedAt: new Date().toISOString(),
+      logsCollected: allLogs.length,
+    });
 
     const canExtend =
       shouldIterateBackwards &&
       windowsProcessed < maxLookbackWindows &&
       currentFrom > 0 &&
-      allLogs.length === 0;
+      !foundLogs;
     if (!canExtend) {
       break;
     }
@@ -314,6 +477,9 @@ const main = async () => {
       break;
     }
     currentFrom = Math.max(currentTo - blockWindow + 1, 0);
+    if (process.stdout.isTTY) {
+      process.stdout.write('\n');
+    }
   }
 
   if (!allLogs.length) {

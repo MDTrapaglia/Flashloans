@@ -22,7 +22,9 @@ Herramientas para inspeccionar actividad reciente de flash loans ejecutada sobre
    - `TOP_INITIATORS`: cantidad de filas a mostrar en el ranking de iniciadores.
    - `FROM_BLOCK`/`TO_BLOCK`: opcionales para forzar un rango específico y analizar exploits históricos.
    - `LOG_CHUNK_BLOCKS`: número máximo de bloques por llamada a `eth_getLogs` (10 por defecto porque es el límite del plan Free de Alchemy).
-   - `MAX_LOOKBACK_WINDOWS`: cuántas ventanas completas de tamaño `BLOCK_WINDOW` se recorrerán hacia atrás si no se encuentran eventos en la ventana más reciente (útil con API keys gratuitas que deben hacer muchas llamadas chicas).
+   - `MAX_LOOKBACK_WINDOWS`: cuántas ventanas completas de tamaño `BLOCK_WINDOW` se recorrerán hacia atrás si no se encuentran eventos en la ventana más reciente (útil para inspeccionar periodos largos con planes gratuitos). Usa `none` para escanear indefinidamente hasta llegar al bloque 0 o encontrar un evento.
+   - `PROGRESS_FILE`: ruta del archivo JSON donde se guarda el último bloque procesado (por defecto `.flashloan-progress.json`).
+   - `RESUME_FROM_PROGRESS`: en `true` reanuda automáticamente desde el bloque almacenado en `PROGRESS_FILE` para continuar escaneando sin repetir bloques.
 
 ## Uso
 
@@ -52,3 +54,9 @@ La salida incluye:
 - Incrementar `MAX_LOOKBACK_WINDOWS` permite escanear automáticamente varias ventanas históricas hasta encontrar actividad relevante.
 - Exportar los datos a CSV/JSON y mezclarlos con dashboards en Dune o Notebooks para cruzar con precios, salud de posiciones o bots conocidos.
 - Complementar con llamadas adicionales a Alchemy (por ejemplo, `getTransactionReceipts`) para capturar más contexto como gas usado o contratos intermedios.
+
+## Reanudación y progreso
+
+Cada ventana procesada guarda su avance en `PROGRESS_FILE` junto al siguiente bloque desde el cual continuar (`nextToBlock`). Si activas `RESUME_FROM_PROGRESS=true`, la próxima ejecución retoma automáticamente desde ese bloque y sigue retrocediendo ventanas hasta encontrar eventos o alcanzar el límite configurado. El script también muestra en tiempo real qué ventana/chunk se está consultando, cuántos logs lleva acumulados y la marca temporal aproximada de los bloques que se están revisando, lo que te ayuda a estimar cuánto falta para llegar a un periodo específico.
+
+Cuando se detecta al menos un evento `FlashLoan`, la búsqueda se detiene de inmediato y se muestran los resúmenes, evitando seguir escaneando bloques innecesariamente.
