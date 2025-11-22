@@ -1,0 +1,385 @@
+import { config as loadEnv } from 'dotenv';
+import { Alchemy, Network } from 'alchemy-sdk';
+import { Interface, formatUnits, getAddress, toQuantity } from 'ethers';
+
+loadEnv();
+
+const DEFAULT_NETWORK = 'eth-mainnet';
+const DEFAULT_POOL_ADDRESS = '0x87870Bca3F3fD6335C3F4ce8392D69350B4fA4E2';
+const FLASH_LOAN_EVENT =
+  'event FlashLoan(address indexed target,address indexed initiator,address indexed asset,uint256 amount,uint256 interestRateMode,uint256 premium,uint16 referralCode)';
+const iface = new Interface([FLASH_LOAN_EVENT]);
+const flashLoanFragment = iface.getEvent('FlashLoan');
+const FLASH_LOAN_TOPIC = flashLoanFragment.topicHash;
+
+const networkMap = {
+  'eth-mainnet': Network.ETH_MAINNET,
+  'eth-goerli': Network.ETH_GOERLI,
+  'eth-sepolia': Network.ETH_SEPOLIA,
+  'polygon-mainnet': Network.MATIC_MAINNET,
+  'polygon-mumbai': Network.MATIC_MUMBAI,
+  'arbitrum-mainnet': Network.ARB_MAINNET,
+  'arbitrum-sepolia': Network.ARB_SEPOLIA,
+  'optimism-mainnet': Network.OPT_MAINNET,
+  'optimism-goerli': Network.OPT_GOERLI,
+};
+
+const numberFormatter = new Intl.NumberFormat('en-US', {
+  maximumFractionDigits: 2,
+});
+
+const usdFormatter = new Intl.NumberFormat('en-US', {
+  style: 'currency',
+  currency: 'USD',
+  maximumFractionDigits: 2,
+});
+
+const shortFormatter = new Intl.NumberFormat('en-US', {
+  maximumFractionDigits: 4,
+});
+
+const chunk = (arr, size) => {
+  const result = [];
+  for (let i = 0; i < arr.length; i += size) {
+    result.push(arr.slice(i, i + size));
+  }
+  return result;
+};
+
+const shortenAddress = (address) => `${address.slice(0, 6)}...${address.slice(-4)}`;
+
+const parseOptionalInt = (value) => {
+  if (value === undefined || value === null || value === '') {
+    return undefined;
+  }
+  const parsed = Number(value);
+  if (Number.isNaN(parsed)) {
+    throw new Error(`No se pudo convertir "${value}" a número.`);
+  }
+  return parsed;
+};
+
+const parseEnvInt = (key, fallback) => {
+  const rawValue = process.env[key];
+  if (rawValue === undefined) {
+    return fallback;
+  }
+  const parsed = Number(rawValue);
+  if (Number.isNaN(parsed)) {
+    throw new Error(`La variable ${key} debe ser un número.`);
+  }
+  return parsed;
+};
+
+const resolveNetwork = (value) => {
+  const normalized = (value || DEFAULT_NETWORK).toLowerCase();
+  const selected = networkMap[normalized];
+  if (!selected) {
+    const available = Object.keys(networkMap).join(', ');
+    throw new Error(`Red "${normalized}" no soportada. Opciones: ${available}`);
+  }
+  return selected;
+};
+
+const decodeLog = (log) => {
+  const parsed = iface.parseLog(log);
+  return {
+    blockNumber:
+      typeof log.blockNumber === 'string'
+        ? Number(BigInt(log.blockNumber))
+        : Number(log.blockNumber),
+    txHash: log.transactionHash,
+    target: getAddress(parsed.args.target),
+    initiator: getAddress(parsed.args.initiator),
+    asset: getAddress(parsed.args.asset),
+    amount: BigInt(parsed.args.amount),
+    premium: BigInt(parsed.args.premium),
+    interestRateMode: Number(parsed.args.interestRateMode),
+    referralCode: Number(parsed.args.referralCode),
+  };
+};
+
+const fetchTokenMetadata = async (alchemy, assets) => {
+  const metadataMap = new Map();
+  for (const asset of assets) {
+    try {
+      const metadata = await alchemy.core.getTokenMetadata(asset);
+      metadataMap.set(asset, {
+        symbol: metadata?.symbol || shortenAddress(asset),
+        name: metadata?.name || 'Unknown token',
+        decimals: typeof metadata?.decimals === 'number' ? metadata.decimals : 18,
+        address: asset,
+      });
+    } catch (error) {
+      console.warn(`No se pudo obtener metadata para ${asset}: ${error.message}`);
+      metadataMap.set(asset, {
+        symbol: shortenAddress(asset),
+        name: 'Unknown token',
+        decimals: 18,
+        address: asset,
+      });
+    }
+  }
+  return metadataMap;
+};
+
+const fetchUsdPrices = async (assetAddresses) => {
+  const priceMap = new Map();
+  if (!assetAddresses.length) {
+    return priceMap;
+  }
+
+  const lowerCaseAddresses = assetAddresses.map((address) => address.toLowerCase());
+  for (const addressesChunk of chunk(lowerCaseAddresses, 30)) {
+    const url = new URL('https://api.coingecko.com/api/v3/simple/token_price/ethereum');
+    url.searchParams.set('contract_addresses', addressesChunk.join(','));
+    url.searchParams.set('vs_currencies', 'usd');
+    try {
+      const response = await fetch(url);
+      if (!response.ok) {
+        console.warn(`No se pudo obtener precios para ${addressesChunk.length} tokens.`);
+        continue;
+      }
+      const data = await response.json();
+      Object.entries(data).forEach(([address, priceInfo]) => {
+        priceMap.set(getAddress(address), typeof priceInfo.usd === 'number' ? priceInfo.usd : null);
+      });
+    } catch (error) {
+      console.warn(`Error al consultar precios: ${error.message}`);
+    }
+  }
+  return priceMap;
+};
+
+const formatUsd = (value) => {
+  if (value === undefined || value === null || Number.isNaN(value)) {
+    return 'N/D';
+  }
+  return usdFormatter.format(value);
+};
+
+const formatNumber = (value) => {
+  if (value === undefined || value === null || Number.isNaN(value)) {
+    return 'N/D';
+  }
+  return numberFormatter.format(value);
+};
+
+const formatAmount = (value) => {
+  if (value === undefined || value === null || Number.isNaN(value)) {
+    return 'N/D';
+  }
+  return shortFormatter.format(value);
+};
+
+const prepareInitiatorRow = (address, stats) => {
+  const topAssets = Array.from(stats.assets.entries())
+    .sort((a, b) => (b[1].usd || 0) - (a[1].usd || 0))
+    .slice(0, 3)
+    .map(([symbol, payload]) => {
+      const amountInfo = `${formatAmount(payload.amount)} ${symbol}`;
+      if (!payload.usd) {
+        return amountInfo;
+      }
+      return `${amountInfo} (${formatUsd(payload.usd)})`;
+    });
+
+  const avgUsd = stats.totalUsd > 0 ? stats.totalUsd / stats.count : undefined;
+
+  return {
+    Initiator: shortenAddress(address),
+    Veces: stats.count,
+    'Volumen USD': formatUsd(stats.totalUsd),
+    'Promedio USD': formatUsd(avgUsd),
+    Tokens: topAssets.join(' | ') || 'N/D',
+    'Targets populares': Array.from(stats.targets.entries())
+      .sort((a, b) => b[1] - a[1])
+      .slice(0, 2)
+      .map(([target, times]) => `${shortenAddress(target)}(${times})`)
+      .join(' '),
+  };
+};
+
+const prepareAssetRow = (asset, stats) => ({
+  Token: `${stats.symbol} (${shortenAddress(asset)})`,
+  Eventos: stats.count,
+  'Volumen token': `${formatAmount(stats.totalAmount)} ${stats.symbol}`,
+  'Volumen USD': formatUsd(stats.totalUsd),
+  'Iniciadores únicos': stats.uniqueInitiators.size,
+});
+
+const printRecentEvents = (events) => {
+  console.log('\nEventos recientes:');
+  events.forEach((event) => {
+    const usdSnippet = event.usdValue ? ` ~ ${formatUsd(event.usdValue)}` : '';
+    console.log(
+      `• Bloque ${event.blockNumber} | ${shortenAddress(event.initiator)} tomó ${formatAmount(
+        event.amountFormatted,
+      )} ${event.metadata.symbol} -> target ${shortenAddress(event.target)}${usdSnippet} (tx ${
+        event.txHash
+      })`,
+    );
+  });
+};
+
+const main = async () => {
+  const apiKey = process.env.ALCHEMY_API_KEY;
+  if (!apiKey) {
+    throw new Error('Falta ALCHEMY_API_KEY en el entorno (.env).');
+  }
+
+  const network = resolveNetwork(process.env.ALCHEMY_NETWORK);
+  const poolAddress = process.env.FLASH_LOAN_CONTRACT
+    ? getAddress(process.env.FLASH_LOAN_CONTRACT)
+    : getAddress(DEFAULT_POOL_ADDRESS);
+  const blockWindow = parseEnvInt('BLOCK_WINDOW', 5000);
+  const topInitiatorsLimit = parseEnvInt('TOP_INITIATORS', 5);
+  const explicitFromBlock = parseOptionalInt(process.env.FROM_BLOCK);
+  const explicitToBlock = parseOptionalInt(process.env.TO_BLOCK);
+
+  const alchemy = new Alchemy({ apiKey, network });
+
+  const latestBlockNumber = await alchemy.core.getBlockNumber();
+  const toBlock = explicitToBlock ?? latestBlockNumber;
+  const fromBlock = explicitFromBlock ?? Math.max(toBlock - blockWindow + 1, 0);
+
+  console.log('==============================================');
+  console.log('Analizador de Flash Loans (Aave v3 / Alchemy)');
+  console.log('==============================================');
+  console.log(`Contrato Pool: ${poolAddress}`);
+  console.log(`Red: ${process.env.ALCHEMY_NETWORK || DEFAULT_NETWORK}`);
+  console.log(`Rango de bloques: ${fromBlock} - ${toBlock}`);
+
+  const logs = await alchemy.core.getLogs({
+    address: poolAddress,
+    fromBlock: toQuantity(fromBlock),
+    toBlock: toQuantity(toBlock),
+    topics: [FLASH_LOAN_TOPIC],
+  });
+
+  if (!logs.length) {
+    console.log('No se encontraron eventos FlashLoan en el rango seleccionado.');
+    return;
+  }
+
+  const parsedEvents = logs.map((log) => decodeLog(log));
+  const assets = Array.from(new Set(parsedEvents.map((event) => event.asset)));
+  const metadataMap = await fetchTokenMetadata(alchemy, assets);
+  const priceMap = await fetchUsdPrices(assets);
+
+  const initiatorStats = new Map();
+  const assetStats = new Map();
+
+  const enrichedEvents = parsedEvents.map((event) => {
+    const metadata = metadataMap.get(event.asset);
+    const decimals = metadata?.decimals ?? 18;
+    const amountFormatted = Number(formatUnits(event.amount, decimals));
+    const premiumFormatted = Number(formatUnits(event.premium, decimals));
+    const usdPrice = priceMap.get(event.asset) ?? null;
+    const usdValue = usdPrice ? amountFormatted * usdPrice : null;
+
+    const initiatorEntry =
+      initiatorStats.get(event.initiator) ||
+      {
+        count: 0,
+        totalUsd: 0,
+        totalAmount: 0,
+        totalPremium: 0,
+        assets: new Map(),
+        targets: new Map(),
+      };
+    initiatorEntry.count += 1;
+    initiatorEntry.totalAmount += amountFormatted;
+    initiatorEntry.totalPremium += premiumFormatted;
+    if (typeof usdValue === 'number') {
+      initiatorEntry.totalUsd += usdValue;
+    }
+    const assetEntry =
+      initiatorEntry.assets.get(metadata.symbol) || {
+        amount: 0,
+        usd: 0,
+      };
+    assetEntry.amount += amountFormatted;
+    if (typeof usdValue === 'number') {
+      assetEntry.usd += usdValue;
+    }
+    initiatorEntry.assets.set(metadata.symbol, assetEntry);
+    initiatorEntry.targets.set(
+      event.target,
+      (initiatorEntry.targets.get(event.target) || 0) + 1,
+    );
+    initiatorStats.set(event.initiator, initiatorEntry);
+
+    const assetStatEntry =
+      assetStats.get(event.asset) ||
+      {
+        symbol: metadata.symbol,
+        count: 0,
+        totalAmount: 0,
+        totalUsd: 0,
+        uniqueInitiators: new Set(),
+      };
+    assetStatEntry.count += 1;
+    assetStatEntry.totalAmount += amountFormatted;
+    if (typeof usdValue === 'number') {
+      assetStatEntry.totalUsd += usdValue;
+    }
+    assetStatEntry.uniqueInitiators.add(event.initiator);
+    assetStats.set(event.asset, assetStatEntry);
+
+    return {
+      ...event,
+      metadata,
+      amountFormatted,
+      premiumFormatted,
+      usdValue,
+    };
+  });
+
+  console.log(`Eventos encontrados: ${enrichedEvents.length}`);
+
+  const initiatorRows = Array.from(initiatorStats.entries())
+    .map(([address, stats]) => ({ raw: stats, address }))
+    .sort((a, b) => {
+      const usdDiff = (b.raw.totalUsd || 0) - (a.raw.totalUsd || 0);
+      if (usdDiff !== 0) {
+        return usdDiff;
+      }
+      return b.raw.count - a.raw.count;
+    })
+    .slice(0, topInitiatorsLimit)
+    .map(({ address, raw }) => prepareInitiatorRow(address, raw));
+
+  if (initiatorRows.length) {
+    console.log('\nTop iniciadores (por volumen estimado USD):');
+    console.table(initiatorRows);
+  }
+
+  const assetRows = Array.from(assetStats.entries())
+    .sort((a, b) => (b[1].totalUsd || 0) - (a[1].totalUsd || 0))
+    .slice(0, 5)
+    .map(([asset, stats]) => prepareAssetRow(asset, stats));
+
+  if (assetRows.length) {
+    console.log('\nTokens más utilizados:');
+    console.table(assetRows);
+  }
+
+  const recentEvents = enrichedEvents
+    .sort((a, b) => b.blockNumber - a.blockNumber)
+    .slice(0, 5);
+  printRecentEvents(recentEvents);
+
+  console.log('\nNotas:');
+  console.log(
+    '- Los montos USD se estiman usando precios de Coingecko al momento de la ejecución.',
+  );
+  console.log(
+    '- Ajusta BLOCK_WINDOW o FROM_BLOCK/TO_BLOCK en .env para explorar otros rangos.',
+  );
+};
+
+main().catch((error) => {
+  console.error('Error ejecutando el analizador:', error.message);
+  process.exit(1);
+});
