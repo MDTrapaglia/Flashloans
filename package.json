@@ -1,0 +1,20 @@
+{
+  "name": "flashloans",
+  "version": "1.0.0",
+  "description": "Herramientas para explorar y analizar actividades de flash loans usando datos de Alchemy.",
+  "type": "module",
+  "main": "src/analyzeFlashLoans.js",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1",
+    "start": "node src/analyzeFlashLoans.js",
+    "analyze:flashloans": "node src/analyzeFlashLoans.js"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "dependencies": {
+    "alchemy-sdk": "^3.6.5",
+    "dotenv": "^17.2.3",
+    "ethers": "^6.15.0"
+  }
+}
