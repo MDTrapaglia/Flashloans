@@ -250,6 +250,17 @@ const main = async () => {
 
   const alchemy = new Alchemy({ apiKey, network });
   const maxBlockSpan = parseEnvInt('LOG_CHUNK_BLOCKS', 10);
+  const maxLookbackWindows = parseEnvInt('MAX_LOOKBACK_WINDOWS', 1);
+
+  if (blockWindow <= 0) {
+    throw new Error('BLOCK_WINDOW debe ser mayor a 0.');
+  }
+  if (maxBlockSpan <= 0) {
+    throw new Error('LOG_CHUNK_BLOCKS debe ser mayor a 0.');
+  }
+  if (maxLookbackWindows <= 0) {
+    throw new Error('MAX_LOOKBACK_WINDOWS debe ser mayor a 0.');
+  }
 
   const latestBlockNumber = await alchemy.core.getBlockNumber();
   const toBlock = explicitToBlock ?? latestBlockNumber;
@@ -263,15 +274,46 @@ const main = async () => {
   console.log(`Rango de bloques: ${fromBlock} - ${toBlock}`);
 
   const allLogs = [];
-  const ranges = chunkBlockRange(fromBlock, toBlock, maxBlockSpan);
-  for (const [chunkFrom, chunkTo] of ranges) {
-    const logs = await alchemy.core.getLogs({
-      address: poolAddress,
-      fromBlock: toQuantity(chunkFrom),
-      toBlock: toQuantity(chunkTo),
-      topics: [FLASH_LOAN_TOPIC],
-    });
-    allLogs.push(...logs);
+  const shouldIterateBackwards = explicitFromBlock === undefined && explicitToBlock === undefined;
+  let currentFrom = fromBlock;
+  let currentTo = toBlock;
+  let windowsProcessed = 0;
+
+  while (currentTo >= currentFrom && currentTo >= 0) {
+    windowsProcessed += 1;
+    console.log(
+      `Buscando eventos en ventana #${windowsProcessed}: bloques ${currentFrom} - ${currentTo}`,
+    );
+    const ranges = chunkBlockRange(currentFrom, currentTo, maxBlockSpan);
+    for (const [chunkFrom, chunkTo] of ranges) {
+      try {
+        const logs = await alchemy.core.getLogs({
+          address: poolAddress,
+          fromBlock: toQuantity(chunkFrom),
+          toBlock: toQuantity(chunkTo),
+          topics: [FLASH_LOAN_TOPIC],
+        });
+        allLogs.push(...logs);
+      } catch (error) {
+        console.warn(
+          `Error al consultar bloques ${chunkFrom}-${chunkTo}: ${error.message}. Intentando continuar...`,
+        );
+      }
+    }
+
+    const canExtend =
+      shouldIterateBackwards &&
+      windowsProcessed < maxLookbackWindows &&
+      currentFrom > 0 &&
+      allLogs.length === 0;
+    if (!canExtend) {
+      break;
+    }
+    currentTo = currentFrom - 1;
+    if (currentTo < 0) {
+      break;
+    }
+    currentFrom = Math.max(currentTo - blockWindow + 1, 0);
   }
 
   if (!allLogs.length) {

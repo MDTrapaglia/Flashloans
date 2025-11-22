@@ -22,6 +22,7 @@ Herramientas para inspeccionar actividad reciente de flash loans ejecutada sobre
    - `TOP_INITIATORS`: cantidad de filas a mostrar en el ranking de iniciadores.
    - `FROM_BLOCK`/`TO_BLOCK`: opcionales para forzar un rango específico y analizar exploits históricos.
    - `LOG_CHUNK_BLOCKS`: número máximo de bloques por llamada a `eth_getLogs` (10 por defecto porque es el límite del plan Free de Alchemy).
+   - `MAX_LOOKBACK_WINDOWS`: cuántas ventanas completas de tamaño `BLOCK_WINDOW` se recorrerán hacia atrás si no se encuentran eventos en la ventana más reciente (útil con API keys gratuitas que deben hacer muchas llamadas chicas).
 
 ## Uso
 
@@ -48,5 +49,6 @@ La salida incluye:
 
 - Ajustar `BLOCK_WINDOW` o definir `FROM_BLOCK` para enfocarse en periodos concretos (post-merge, días de alta volatilidad, etc.).
 - Si usas un plan pago de Alchemy puedes subir `LOG_CHUNK_BLOCKS` para reducir el número de llamadas necesarias.
+- Incrementar `MAX_LOOKBACK_WINDOWS` permite escanear automáticamente varias ventanas históricas hasta encontrar actividad relevante.
 - Exportar los datos a CSV/JSON y mezclarlos con dashboards en Dune o Notebooks para cruzar con precios, salud de posiciones o bots conocidos.
 - Complementar con llamadas adicionales a Alchemy (por ejemplo, `getTransactionReceipts`) para capturar más contexto como gas usado o contratos intermedios.
