@@ -7,7 +7,8 @@
   "scripts": {
     "test": "echo \"Error: no test specified\" && exit 1",
     "start": "node src/analyzeFlashLoans.js",
-    "analyze:flashloans": "node src/analyzeFlashLoans.js"
+    "analyze:flashloans": "node src/analyzeFlashLoans.js",
+    "trace:tx": "node src/traceTransaction.js"
   },
   "keywords": [],
   "author": "",

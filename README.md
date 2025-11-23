@@ -25,6 +25,7 @@ Herramientas para inspeccionar actividad reciente de flash loans ejecutada sobre
    - `MAX_LOOKBACK_WINDOWS`: cuántas ventanas completas de tamaño `BLOCK_WINDOW` se recorrerán hacia atrás si no se encuentran eventos en la ventana más reciente (útil para inspeccionar periodos largos con planes gratuitos). Usa `none` para escanear indefinidamente hasta llegar al bloque 0 o encontrar un evento.
    - `PROGRESS_FILE`: ruta del archivo JSON donde se guarda el último bloque procesado (por defecto `.flashloan-progress.json`).
    - `RESUME_FROM_PROGRESS`: en `true` reanuda automáticamente desde el bloque almacenado en `PROGRESS_FILE` para continuar escaneando sin repetir bloques.
+   - `FLASHLOAN_EVENTS_FILE`: ruta del archivo donde se persistirán los eventos detectados en formato JSON (por defecto `data/flashloan-events.json`). Déjalo vacío para desactivar la escritura.
 
 ## Uso
 
@@ -46,6 +47,22 @@ La salida incluye:
 - Ranking de iniciadores ordenado por volumen estimado en USD (se consulta el precio vía Coingecko).
 - Tokens más utilizados y cuántos iniciadores distintos interaccionaron con cada uno.
 - Un resumen textual de los eventos más recientes para detectar patrones o estrategias repetidas.
+- Un archivo JSON persistido en la ruta configurada por `FLASHLOAN_EVENTS_FILE` con todos los eventos detectados (direcciones, montos, estimaciones en USD, etc.) listo para ser versionado o analizado con herramientas externas.
+
+### Script para inspeccionar una transacción
+
+Cuando quieras reconstruir una operación puntual (por ejemplo, una transacción con flash loan ya identificada) ejecuta:
+
+```bash
+npm run trace:tx -- --tx 0xHASH_DE_LA_TX
+```
+
+También puedes definir `TX_HASH` en tu entorno y omitir el flag `--tx`. El script consulta el receipt y el `debug_traceTransaction`, mostrando:
+
+- Contexto general (bloque, timestamp, estado, gas usado, fee estimado).
+- Eventos `Transfer` de ERC20 con cantidades formateadas.
+- Tabla de llamadas dirigidas a routers/DEx/agregadores conocidos (Uniswap, 1inch, 0x, Balancer, etc.).
+- Un árbol resumido de llamadas internas para detectar qué contratos participaron en la estrategia.
 
 ## Ideas de análisis adicionales
 
