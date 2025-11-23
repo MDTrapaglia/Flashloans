@@ -8,7 +8,7 @@ loadEnv();
 const DEFAULT_NETWORK = 'eth-mainnet';
 const DEFAULT_POOL_ADDRESS = '0x87870Bca3F3fD6335C3F4ce8392D69350B4fA4E2';
 const FLASH_LOAN_EVENT =
-  'event FlashLoan(address indexed target,address indexed initiator,address indexed asset,uint256 amount,uint256 interestRateMode,uint256 premium,uint16 referralCode)';
+  'event FlashLoan(address indexed target,address initiator,address indexed asset,uint256 amount,uint8 interestRateMode,uint256 premium,uint16 indexed referralCode)';
 const iface = new Interface([FLASH_LOAN_EVENT]);
 const flashLoanFragment = iface.getEvent('FlashLoan');
 const FLASH_LOAN_TOPIC = flashLoanFragment.topicHash;

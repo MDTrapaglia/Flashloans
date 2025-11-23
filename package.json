@@ -13,6 +13,7 @@
   "author": "",
   "license": "ISC",
   "dependencies": {
+    "@aave/core-v3": "^1.19.3",
     "alchemy-sdk": "^3.6.5",
     "dotenv": "^17.2.3",
     "ethers": "^6.15.0"
