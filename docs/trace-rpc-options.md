@@ -31,8 +31,8 @@ Estos sí permiten `debug_traceTransaction`, pero necesitamos generar credencial
 
 2. **Tenderly**
    - Crear workspace y project (gratuito) en https://dashboard.tenderly.co.
-   - Cada proyecto expone un endpoint RPC con `Project Access Key` que soporta `debug_traceTransaction` y el simulador avanzado.
-   - Tiene límite de ~20k simulaciones/mes en plan Free.
+   - Cada proyecto expone un endpoint RPC con `Project Access Key`. En los endpoints `virtual.mainnet...` probados, `debug_traceTransaction` responde `not supported`, pero `trace_transaction` funciona y entrega el árbol de llamadas completo.
+   - Tiene límite de ~20k simulaciones/mes en plan Free y requiere enviar el header `X-Access-Key: <Project Access Key>`.
 
 3. **QuickNode / Blast / Chainstack**
    - Todos tienen trials gratuitos (duración o cuota limitada) y permiten habilitar `debug_traceTransaction`/`trace_transaction` agregando el add-on correspondiente. Ideal para pruebas cortas.

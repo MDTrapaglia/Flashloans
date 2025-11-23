@@ -43,6 +43,53 @@ const knownContracts = [
 }));
 const knownContractsMap = new Map(knownContracts.map((item) => [item.checksum, item]));
 
+const traceRpcUrl = process.env.TRACE_RPC_URL?.trim() || null;
+const traceRpcMethod =
+  process.env.TRACE_RPC_METHOD?.trim() ||
+  (traceRpcUrl ? 'trace_transaction' : 'debug_traceTransaction');
+const traceRpcFallbackMethod =
+  process.env.TRACE_RPC_FALLBACK_METHOD?.trim() ||
+  (traceRpcMethod !== 'trace_transaction' ? 'trace_transaction' : null);
+const traceRpcHeaderName = process.env.TRACE_RPC_HEADER_NAME?.trim() || null;
+const traceRpcHeaderValue = process.env.TRACE_RPC_HEADER_VALUE?.trim() || null;
+let traceRpcExtraHeaders = {};
+if (process.env.TRACE_RPC_HEADERS_JSON) {
+  try {
+    const parsed = JSON.parse(process.env.TRACE_RPC_HEADERS_JSON);
+    if (parsed && typeof parsed === 'object') {
+      traceRpcExtraHeaders = parsed;
+    } else {
+      console.warn('TRACE_RPC_HEADERS_JSON debe ser un objeto JSON plano.');
+    }
+  } catch (error) {
+    console.warn(`No se pudo parsear TRACE_RPC_HEADERS_JSON: ${error.message}`);
+  }
+}
+
+const buildTraceRpcHeaders = () => {
+  const headers = { 'Content-Type': 'application/json' };
+  if (traceRpcHeaderName && traceRpcHeaderValue) {
+    headers[traceRpcHeaderName] = traceRpcHeaderValue;
+  }
+  Object.entries(traceRpcExtraHeaders).forEach(([key, value]) => {
+    headers[key] = value;
+  });
+  return headers;
+};
+
+const traceRpcConfig = traceRpcUrl
+  ? {
+      url: traceRpcUrl,
+      method: traceRpcMethod,
+      fallbackMethod:
+        process.env.TRACE_RPC_FALLBACK_METHOD?.trim() ||
+        (traceRpcFallbackMethod && traceRpcFallbackMethod !== traceRpcMethod
+          ? traceRpcFallbackMethod
+          : null),
+      headers: buildTraceRpcHeaders(),
+    }
+  : null;
+
 const shortenAddress = (address) => {
   if (!address) {
     return 'N/D';
@@ -199,40 +246,70 @@ const extractTransferEvents = (receipt) => {
     .filter(Boolean);
 };
 
-const flattenTrace = (traceResult) => {
+const flattenCallTracerNode = (node, depth, output) => {
+  if (!node) {
+    return;
+  }
+  const to = normalizeAddress(node.to);
+  const inputData = typeof node.input === 'string' ? node.input : '0x';
+  output.push({
+    depth,
+    type: node.type || node.callType || 'call',
+    from: normalizeAddress(node.from),
+    to,
+    valueWei: toBigIntSafe(node.value),
+    gas: Number(toBigIntSafe(node.gas)),
+    gasUsed: Number(toBigIntSafe(node.gasUsed)),
+    input: inputData,
+    selector: inputData && inputData !== '0x' ? inputData.slice(0, 10) : '0x',
+    error: node.error || node.revertReason || null,
+    knownContract: to ? knownContractsMap.get(to) : undefined,
+  });
+  if (Array.isArray(node.calls)) {
+    node.calls.forEach((child) => flattenCallTracerNode(child, depth + 1, output));
+  }
+};
+
+const flattenCallTracerResult = (traceResult) => {
+  const nodes = Array.isArray(traceResult) ? traceResult : [traceResult];
+  const output = [];
+  nodes.forEach((root) => flattenCallTracerNode(root, 0, output));
+  return output;
+};
+
+const flattenParityTraceResult = (traceEntries) => {
+  if (!Array.isArray(traceEntries)) {
+    return [];
+  }
+  return traceEntries
+    .filter((entry) => entry.type === 'call' || entry.action?.callType)
+    .map((entry) => {
+      const inputData = entry.action?.input || '0x';
+      const to = normalizeAddress(entry.action?.to || entry.action?.address);
+      return {
+        depth: Array.isArray(entry.traceAddress) ? entry.traceAddress.length : 0,
+        type: entry.action?.callType || entry.type || 'call',
+        from: normalizeAddress(entry.action?.from),
+        to,
+        valueWei: toBigIntSafe(entry.action?.value),
+        gas: Number(toBigIntSafe(entry.action?.gas)),
+        gasUsed: Number(toBigIntSafe(entry.result?.gasUsed)),
+        input: inputData,
+        selector: inputData && inputData !== '0x' ? inputData.slice(0, 10) : '0x',
+        error: entry.error || entry.result?.error || null,
+        knownContract: to ? knownContractsMap.get(to) : undefined,
+      };
+    });
+};
+
+const normalizeTraceCalls = (traceResult) => {
   if (!traceResult) {
     return [];
   }
-  const results = [];
-  const nodes = Array.isArray(traceResult) ? traceResult : [traceResult];
-  const visit = (node, depth) => {
-    if (!node) {
-      return;
-    }
-    const to = normalizeAddress(node.to);
-    const callEntry = {
-      depth,
-      type: node.type,
-      from: normalizeAddress(node.from),
-      to,
-      valueWei: toBigIntSafe(node.value),
-      gas: Number(toBigIntSafe(node.gas)),
-      gasUsed: Number(toBigIntSafe(node.gasUsed)),
-      input: typeof node.input === 'string' ? node.input : '0x',
-      selector:
-        typeof node.input === 'string' && node.input.length >= 10
-          ? node.input.slice(0, 10)
-          : '0x',
-      error: node.error || node.revertReason || null,
-      knownContract: to ? knownContractsMap.get(to) : undefined,
-    };
-    results.push(callEntry);
-    if (Array.isArray(node.calls)) {
-      node.calls.forEach((child) => visit(child, depth + 1));
-    }
-  };
-  nodes.forEach((root) => visit(root, 0));
-  return results;
+  if (Array.isArray(traceResult)) {
+    return flattenParityTraceResult(traceResult);
+  }
+  return flattenCallTracerResult(traceResult);
 };
 
 const printCallTree = (calls) => {
@@ -274,6 +351,63 @@ const renderDexTable = (dexCalls) => {
   console.table(rows);
 };
 
+const sendJsonRpcRequest = async ({ url, method, params, headers }) => {
+  const response = await fetch(url, {
+    method: 'POST',
+    headers,
+    body: JSON.stringify({
+      jsonrpc: '2.0',
+      id: Date.now(),
+      method,
+      params,
+    }),
+  });
+  const payload = await response.json();
+  if (payload.error) {
+    const message = payload.error?.message || 'Error desconocido';
+    const code = payload.error?.code;
+    throw new Error(`${message} (código ${code ?? 'N/D'})`);
+  }
+  return payload.result;
+};
+
+const fetchTraceFromCustomRpc = async (txHash) => {
+  if (!traceRpcConfig) {
+    return { result: null, format: null };
+  }
+  const headers = traceRpcConfig.headers || { 'Content-Type': 'application/json' };
+  const paramsFor = (method) =>
+    method === 'trace_transaction'
+      ? [txHash]
+      : [txHash, { tracer: 'callTracer', onlyTopCall: false }];
+
+  const attempt = async (method) => {
+    const result = await sendJsonRpcRequest({
+      url: traceRpcConfig.url,
+      method,
+      params: paramsFor(method),
+      headers,
+    });
+    return {
+      result,
+      format: method === 'trace_transaction' ? 'parity' : 'callTracer',
+      method,
+    };
+  };
+
+  try {
+    return await attempt(traceRpcConfig.method);
+  } catch (error) {
+    if (traceRpcConfig.fallbackMethod && traceRpcConfig.fallbackMethod !== traceRpcConfig.method) {
+      console.warn(
+        `Método ${traceRpcConfig.method} falló (${error.message}). Intentando ${traceRpcConfig.fallbackMethod}...`,
+      );
+      return attempt(traceRpcConfig.fallbackMethod);
+    }
+    throw error;
+  }
+};
+
 const main = async () => {
   const apiKey = process.env.ALCHEMY_API_KEY;
   if (!apiKey) {
@@ -313,13 +447,23 @@ const main = async () => {
     : new Map();
 
   let traceResult = null;
-  try {
-    traceResult = await alchemy.debug.traceTransaction(normalizedHash, {
-      type: 'callTracer',
-      onlyTopCall: false,
-    });
-  } catch (error) {
-    console.warn(`No se pudo obtener el trace: ${error.message}`);
+  if (traceRpcConfig) {
+    try {
+      const { result } = await fetchTraceFromCustomRpc(normalizedHash);
+      traceResult = result;
+    } catch (error) {
+      console.warn(`No se pudo obtener el trace desde TRACE_RPC_URL: ${error.message}`);
+    }
+  }
+  if (!traceResult) {
+    try {
+      traceResult = await alchemy.debug.traceTransaction(normalizedHash, {
+        type: 'callTracer',
+        onlyTopCall: false,
+      });
+    } catch (error) {
+      console.warn(`No se pudo obtener el trace: ${error.message}`);
+    }
   }
 
   const valueWei = tx.value ? BigInt(tx.value) : 0n;
@@ -359,7 +503,7 @@ const main = async () => {
     console.log('\nNo se detectaron eventos Transfer ERC20 en el receipt.');
   }
 
-  const flattenedTrace = flattenTrace(traceResult);
+  const flattenedTrace = normalizeTraceCalls(traceResult);
   renderDexTable(flattenedTrace.filter((call) => call.knownContract));
   printCallTree(flattenedTrace);
 };

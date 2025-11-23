@@ -26,6 +26,7 @@ Herramientas para inspeccionar actividad reciente de flash loans ejecutada sobre
    - `PROGRESS_FILE`: ruta del archivo JSON donde se guarda el último bloque procesado (por defecto `.flashloan-progress.json`).
    - `RESUME_FROM_PROGRESS`: en `true` reanuda automáticamente desde el bloque almacenado en `PROGRESS_FILE` para continuar escaneando sin repetir bloques.
    - `FLASHLOAN_EVENTS_FILE`: ruta del archivo donde se persistirán los eventos detectados en formato JSON (por defecto `data/flashloan-events.json`). Déjalo vacío para desactivar la escritura.
+   - `TRACE_RPC_URL`/`TRACE_RPC_METHOD`: opcionales para consultar trazas de transacciones en un proveedor externo (Tenderly, Ankr, nodo propio). Si no se definen, se usa `debug_traceTransaction` vía Alchemy. Puedes especificar encabezados de autenticación con `TRACE_RPC_HEADER_NAME`, `TRACE_RPC_HEADER_VALUE` o `TRACE_RPC_HEADERS_JSON` (JSON con pares clave-valor).
 
 ## Uso
 
@@ -63,6 +64,8 @@ También puedes definir `TX_HASH` en tu entorno y omitir el flag `--tx`. El scri
 - Eventos `Transfer` de ERC20 con cantidades formateadas.
 - Tabla de llamadas dirigidas a routers/DEx/agregadores conocidos (Uniswap, 1inch, 0x, Balancer, etc.).
 - Un árbol resumido de llamadas internas para detectar qué contratos participaron en la estrategia.
+
+Si configuras `TRACE_RPC_URL` (por ejemplo, un endpoint de Tenderly), el script usará ese RPC para pedir la traza. Intenta primero el método configurado (`TRACE_RPC_METHOD`, por defecto `trace_transaction`) y, si falla, recurre automáticamente al fallback (`TRACE_RPC_FALLBACK_METHOD`). Esto permite trabajar con proveedores que no soportan `debug_traceTransaction`, manteniendo la misma salida del analizador.
 
 ## Ideas de análisis adicionales
 

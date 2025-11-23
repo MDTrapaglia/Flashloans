@@ -1,5 +1,6 @@
 import { config as loadEnv } from 'dotenv';
 import { promises as fs } from 'fs';
+import path from 'path';
 import { Alchemy, Network } from 'alchemy-sdk';
 import { Interface, formatUnits, getAddress, toQuantity } from 'ethers';
 
@@ -7,6 +8,7 @@ loadEnv();
 
 const DEFAULT_NETWORK = 'eth-mainnet';
 const DEFAULT_POOL_ADDRESS = '0x87870Bca3F3fD6335C3F4ce8392D69350B4fA4E2';
+const DEFAULT_EVENTS_OUTPUT_FILE = 'data/flashloan-events.json';
 const FLASH_LOAN_EVENT =
   'event FlashLoan(address indexed target,address initiator,address indexed asset,uint256 amount,uint8 interestRateMode,uint256 premium,uint16 indexed referralCode)';
 const iface = new Interface([FLASH_LOAN_EVENT]);
@@ -113,6 +115,80 @@ const describeRpcError = (error) => {
   return 'Error desconocido';
 };
 
+const ensureDirectoryForFile = async (filepath) => {
+  if (!filepath) {
+    return;
+  }
+  const directory = path.dirname(filepath);
+  if (!directory || directory === '.' || directory === '/') {
+    return;
+  }
+  await fs.mkdir(directory, { recursive: true });
+};
+
+const persistEventsToFile = async (events, targetFile) => {
+  if (!targetFile || !events?.length) {
+    return;
+  }
+  const resolvedPath = path.isAbsolute(targetFile)
+    ? targetFile
+    : path.resolve(process.cwd(), targetFile);
+  await ensureDirectoryForFile(resolvedPath);
+  const serialized = events.map((event) => ({
+    blockNumber: event.blockNumber,
+    blockTimestamp: event.blockTimestamp ?? null,
+    transactionHash: event.txHash,
+    logIndex: event.logIndex,
+    transactionIndex: event.transactionIndex,
+    target: event.target,
+    initiator: event.initiator,
+    asset: {
+      address: event.asset,
+      symbol: event.metadata?.symbol ?? null,
+      name: event.metadata?.name ?? null,
+      decimals: event.metadata?.decimals ?? null,
+    },
+    amount: event.amount.toString(),
+    amountFormatted: event.amountFormatted,
+    premium: event.premium.toString(),
+    premiumFormatted: event.premiumFormatted,
+    usdPrice: event.usdPrice,
+    usdValue: event.usdValue,
+    premiumUsdValue: event.premiumUsdValue,
+    interestRateMode: event.interestRateMode,
+    referralCode: event.referralCode,
+  }));
+  await fs.writeFile(resolvedPath, JSON.stringify(serialized, null, 2));
+  const relativePath = path.relative(process.cwd(), resolvedPath);
+  console.log(`\nSe guardaron ${serialized.length} eventos en ${relativePath}`);
+};
+
+const fetchBlockTimestampsForEvents = async (alchemy, events) => {
+  const timestampMap = new Map();
+  const uniqueBlocks = Array.from(new Set(events.map((event) => event.blockNumber))).filter(
+    (blockNumber) => typeof blockNumber === 'number' && blockNumber >= 0,
+  );
+  if (!uniqueBlocks.length) {
+    return timestampMap;
+  }
+  for (const blockChunk of chunk(uniqueBlocks, 5)) {
+    await Promise.all(
+      blockChunk.map(async (blockNumber) => {
+        try {
+          const block = await alchemy.core.getBlock(blockNumber);
+          timestampMap.set(blockNumber, block?.timestamp ?? null);
+        } catch (error) {
+          console.warn(
+            `No se pudo obtener timestamp para bloque ${blockNumber}: ${error.message}`,
+          );
+          timestampMap.set(blockNumber, null);
+        }
+      }),
+    );
+  }
+  return timestampMap;
+};
+
 const resolveNetwork = (value) => {
   const normalized = (value || DEFAULT_NETWORK).toLowerCase();
   const selected = networkMap[normalized];
@@ -204,6 +280,14 @@ const decodeLog = (log) => {
     premium: BigInt(parsed.args.premium),
     interestRateMode: Number(parsed.args.interestRateMode),
     referralCode: Number(parsed.args.referralCode),
+    logIndex:
+      typeof log.logIndex === 'string'
+        ? Number(BigInt(log.logIndex))
+        : Number(log.logIndex ?? 0),
+    transactionIndex:
+      typeof log.transactionIndex === 'string'
+        ? Number(BigInt(log.transactionIndex))
+        : Number(log.transactionIndex ?? 0),
   };
 };
 
@@ -352,6 +436,7 @@ const main = async () => {
   const maxLookbackWindows = infiniteLookback ? Infinity : parseEnvInt('MAX_LOOKBACK_WINDOWS', 1);
   const progressFilePath = process.env.PROGRESS_FILE || '.flashloan-progress.json';
   const resumeFromProgress = parseEnvBool('RESUME_FROM_PROGRESS', false);
+  const eventsOutputFile = (process.env.FLASHLOAN_EVENTS_FILE || DEFAULT_EVENTS_OUTPUT_FILE).trim();
 
   if (blockWindow <= 0) {
     throw new Error('BLOCK_WINDOW debe ser mayor a 0.');
@@ -491,6 +576,7 @@ const main = async () => {
   const assets = Array.from(new Set(parsedEvents.map((event) => event.asset)));
   const metadataMap = await fetchTokenMetadata(alchemy, assets);
   const priceMap = await fetchUsdPrices(assets);
+  const blockTimestampMap = await fetchBlockTimestampsForEvents(alchemy, parsedEvents);
 
   const initiatorStats = new Map();
   const assetStats = new Map();
@@ -501,7 +587,8 @@ const main = async () => {
     const amountFormatted = Number(formatUnits(event.amount, decimals));
     const premiumFormatted = Number(formatUnits(event.premium, decimals));
     const usdPrice = priceMap.get(event.asset) ?? null;
-    const usdValue = usdPrice ? amountFormatted * usdPrice : null;
+    const usdValue = typeof usdPrice === 'number' ? amountFormatted * usdPrice : null;
+    const premiumUsdValue = typeof usdPrice === 'number' ? premiumFormatted * usdPrice : null;
 
     const initiatorEntry =
       initiatorStats.get(event.initiator) ||
@@ -558,6 +645,9 @@ const main = async () => {
       amountFormatted,
       premiumFormatted,
       usdValue,
+      usdPrice,
+      premiumUsdValue,
+      blockTimestamp: blockTimestampMap.get(event.blockNumber) ?? null,
     };
   });
 
@@ -594,6 +684,10 @@ const main = async () => {
     .sort((a, b) => b.blockNumber - a.blockNumber)
     .slice(0, 5);
   printRecentEvents(recentEvents);
+
+  if (eventsOutputFile) {
+    await persistEventsToFile(enrichedEvents, eventsOutputFile);
+  }
 
   console.log('\nNotas:');
   console.log(
